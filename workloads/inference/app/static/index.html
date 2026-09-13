@@ -261,9 +261,13 @@ function purposeFromHour(hour) {
   return hour !== null && hour >= 17 ? "저녁" : "점심";
 }
 
-/** 가맹점 정보의 '상호' 값. 같은 줄에 있으면 그걸 쓰고, 없으면 다음 줄을 쓴다. */
-function extractMerchant(texts) {
-  for (let i = 0; i < texts.length; i++) {
+// 영수증의 두 섹션. 가맹점(결제 주체)과 판매자(실제 매장)의 상호가 다를 수 있다.
+const MERCHANT_SECTION = /가\s*맹\s*점/;
+const SELLER_SECTION = /판\s*매\s*자|공\s*급\s*자/;
+
+/** texts[start, end) 구간에서 '상호' 값을 찾는다. 같은 줄에 없으면 다음 줄을 쓴다. */
+function tradeNameIn(texts, start, end) {
+  for (let i = start; i < end; i++) {
     if (!/상\s*호/.test(texts[i])) continue;
     const inline = texts[i].replace(/^.*상\s*호\s*(명)?\s*[:：]?\s*/, "").trim();
     if (inline) return inline;
@@ -273,10 +277,40 @@ function extractMerchant(texts) {
   return "";
 }
 
-/** 맨 뒤에 붙는 상호는 영수증 첫 줄의 첫 단어. */
-function extractStore(texts) {
-  const first = (texts[0] || "").trim();
-  return first.split(/\s+/)[0] || "";
+function firstWord(text) {
+  return (text || "").trim().split(/\s+/)[0] || "";
+}
+
+/** 두 섹션의 시작 위치. 한쪽 구간이 다른 쪽을 침범하지 않도록 경계로 쓴다. */
+function sectionBounds(texts) {
+  return {
+    merchantAt: texts.findIndex(t => MERCHANT_SECTION.test(t)),
+    sellerAt: texts.findIndex(t => SELLER_SECTION.test(t)),
+  };
+}
+
+/** 가맹점 정보의 상호. 예: (주)우아한형제들 */
+function extractMerchant(texts) {
+  const { merchantAt, sellerAt } = sectionBounds(texts);
+  if (merchantAt !== -1) {
+    const end = sellerAt > merchantAt ? sellerAt : texts.length;
+    const name = tradeNameIn(texts, merchantAt, end);
+    if (name) return name;
+  }
+  // 가맹점 섹션이 없으면 판매자 섹션 앞쪽에서만 찾는다(판매자 상호를 끌어오지 않도록).
+  return tradeNameIn(texts, 0, sellerAt === -1 ? texts.length : sellerAt);
+}
+
+/** 판매자 정보의 상호 중 첫 번째 단어. 예: '메머드 익스프레스 강남점' -> '메머드' */
+function extractSeller(texts) {
+  const { merchantAt, sellerAt } = sectionBounds(texts);
+  if (sellerAt !== -1) {
+    const end = merchantAt > sellerAt ? merchantAt : texts.length;
+    const name = tradeNameIn(texts, sellerAt, end);
+    if (name) return firstWord(name);
+  }
+  // 판매자 섹션이 없으면 영수증 첫 줄(매장 표시명)을 쓴다.
+  return firstWord(texts[0] || "");
 }
 
 function buildName(date, merchant, purpose, store) {
@@ -295,7 +329,7 @@ function renderCard(slot, payload, roundTripMs) {
       <div class="field"><label>날짜</label><input type="text" class="f-date"></div>
       <div class="field"><label>가맹점</label><input type="text" class="f-merchant"></div>
       <div class="field"><label>용도</label><input type="text" class="f-purpose"></div>
-      <div class="field"><label>상호</label><input type="text" class="f-store"></div>
+      <div class="field"><label>판매자</label><input type="text" class="f-store"></div>
     </div>
     ${renderTable(payload, roundTripMs)}`;
 
@@ -310,7 +344,7 @@ function renderCard(slot, payload, roundTripMs) {
   fields.date.value = paidAt.date;
   fields.merchant.value = extractMerchant(texts);
   fields.purpose.value = purposeFromHour(paidAt.hour);
-  fields.store.value = extractStore(texts);
+  fields.store.value = extractSeller(texts);
 
   const update = () => {
     code.textContent = buildName(
