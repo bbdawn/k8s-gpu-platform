@@ -82,6 +82,7 @@
 
   <div class="controls">
     <button id="copyAll" class="ghost" disabled>전체 복사</button>
+    <button id="downloadAll" class="ghost" disabled>전체 다운로드</button>
   </div>
 
   <div id="summary"></div>
@@ -96,6 +97,7 @@ const fileInput = document.getElementById("file");
 const summary = document.getElementById("summary");
 const cards = document.getElementById("cards");
 const copyAllBtn = document.getElementById("copyAll");
+const downloadAllBtn = document.getElementById("downloadAll");
 
 // 카드별 상태. [전체 복사]가 여기서 문자열을 모은다.
 const items = [];
@@ -120,6 +122,18 @@ drop.addEventListener("drop", e => {
 });
 fileInput.addEventListener("change", () => sendAll(fileInput.files));
 
+downloadAllBtn.addEventListener("click", async () => {
+  const label = downloadAllBtn.textContent;
+  downloadAllBtn.disabled = true;
+  for (const item of items) {
+    downloadFile(item.file, downloadName(item.file, item.code.textContent));
+    // 브라우저가 연속 다운로드를 막지 않도록 약간 간격을 둔다.
+    await new Promise(resolve => setTimeout(resolve, 300));
+  }
+  downloadAllBtn.textContent = `${items.length}건 저장됨`;
+  setTimeout(() => { downloadAllBtn.textContent = label; downloadAllBtn.disabled = false; }, 1500);
+});
+
 copyAllBtn.addEventListener("click", () => {
   const lines = items.map(item => item.code.textContent).filter(Boolean);
   copyText(lines.join("\n"), copyAllBtn, `${lines.length}건 복사됨`);
@@ -137,6 +151,7 @@ async function sendAll(fileList) {
   cards.innerHTML = "";
   items.length = 0;
   copyAllBtn.disabled = true;
+  downloadAllBtn.disabled = true;
   summary.innerHTML = `<b>${files.length}</b>장 인식 중…`;
 
   const startedAt = performance.now();
@@ -148,6 +163,7 @@ async function sendAll(fileList) {
   const totalInferenceMs = ok.reduce((sum, r) => sum + r.payload.elapsed_ms, 0);
 
   copyAllBtn.disabled = items.length === 0;
+  downloadAllBtn.disabled = items.length === 0;
   summary.innerHTML =
     `<b>${ok.length}</b>/<b>${files.length}</b>장 성공 · ` +
     `텍스트 <b>${totalTexts}</b>건 · ` +
@@ -185,7 +201,7 @@ async function sendOne(file) {
     return { file, payload: null };
   }
 
-  renderCard(slot, payload, roundTripMs);
+  renderCard(slot, file, payload, roundTripMs);
   return { file, payload };
 }
 
@@ -319,12 +335,12 @@ function buildName(date, merchant, purpose, store) {
 
 // --- 렌더링 -----------------------------------------------------------------
 
-function renderCard(slot, payload, roundTripMs) {
+function renderCard(slot, file, payload, roundTripMs) {
   const texts = payload.text.map(t => t.text);
   const paidAt = extractPaidAt(texts);
 
   slot.innerHTML = `
-    <div class="out"><code></code><button type="button">복사</button></div>
+    <div class="out"><code></code><button type="button" class="b-copy">복사</button><button type="button" class="b-download ghost">다운로드</button></div>
     <div class="inline">
       <div class="field"><label>날짜</label><input type="text" class="f-date"></div>
       <div class="field"><label>가맹점</label><input type="text" class="f-merchant"></div>
@@ -357,10 +373,18 @@ function renderCard(slot, payload, roundTripMs) {
   for (const field of Object.values(fields)) field.addEventListener("input", update);
   update();
 
-  items.push({ code });
+  items.push({ code, file });
 
-  const button = slot.querySelector(".out button");
-  button.addEventListener("click", () => copyText(code.textContent, button, "복사됨"));
+  const copyBtn = slot.querySelector(".b-copy");
+  copyBtn.addEventListener("click", () => copyText(code.textContent, copyBtn, "복사됨"));
+
+  const downloadBtn = slot.querySelector(".b-download");
+  downloadBtn.addEventListener("click", () => {
+    downloadFile(file, downloadName(file, code.textContent));
+    const label = downloadBtn.textContent;
+    downloadBtn.textContent = "저장됨";
+    setTimeout(() => { downloadBtn.textContent = label; }, 1200);
+  });
 }
 
 function renderTable(payload, roundTripMs) {
@@ -377,6 +401,30 @@ function renderTable(payload, roundTripMs) {
   ).join("");
   return `<table><thead><tr><th>텍스트</th><th class="conf">신뢰도</th></tr></thead>` +
          `<tbody>${rows}</tbody></table>${stats}`;
+}
+
+// --- 다운로드 ---------------------------------------------------------------
+
+// 파일명에 쓸 수 없는 문자. 상호에 섞여 들어와도 저장이 실패하지 않게 걷어낸다.
+const ILLEGAL_IN_FILENAME = /[\\/:*?"<>|\u0000-\u001f]/g;
+
+/** 생성된 이름 + 원본 확장자. 이름이 비면 원본 파일명을 그대로 쓴다. */
+function downloadName(file, base) {
+  const ext = (file.name.match(/\.[^./\\]+$/) || [""])[0];
+  const safe = base.replace(ILLEGAL_IN_FILENAME, "").trim();
+  return safe ? safe + ext : file.name;
+}
+
+/** 업로드한 원본 파일을 그대로, 이름만 바꿔서 저장한다. */
+function downloadFile(file, name) {
+  const url = URL.createObjectURL(file);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // --- 복사 -------------------------------------------------------------------
