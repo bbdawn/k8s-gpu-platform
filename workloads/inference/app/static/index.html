@@ -27,6 +27,30 @@
     padding: 36px 16px; text-align: center; color: var(--muted); cursor: pointer;
   }
   #drop.over { border-color: var(--accent); background: #f2f6ff; color: var(--accent); }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin-top: 16px; }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 12px; color: var(--muted); font-weight: 600; }
+  input[type=text] {
+    font: inherit; padding: 6px 8px; border: 1px solid var(--line);
+    border-radius: 6px; background: var(--card); color: var(--text);
+  }
+  button {
+    font: inherit; font-weight: 600; padding: 6px 12px; border-radius: 6px;
+    border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer;
+  }
+  button.ghost { background: var(--card); color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  .out {
+    display: flex; gap: 8px; align-items: center; margin-bottom: 8px;
+    background: #f2f5fb; border: 1px solid #d9e2f5; border-radius: 6px; padding: 8px;
+  }
+  .out code {
+    flex: 1; min-width: 0; font-size: 13px; word-break: break-all;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .out button { flex: 0 0 auto; padding: 4px 10px; font-size: 12px; }
+  .inline { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  .inline .field { flex: 1 1 130px; }
   #summary { margin-top: 16px; color: var(--muted); }
   #summary b { color: var(--text); font-variant-numeric: tabular-nums; }
   .card { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; background: var(--card);
@@ -56,6 +80,18 @@
     <input type="file" id="file" accept="image/jpeg,image/png" multiple hidden>
   </div>
 
+  <div class="controls">
+    <div class="field">
+      <label for="company">회사명</label>
+      <input type="text" id="company" value="(주)우아한형제들">
+    </div>
+    <div class="field">
+      <label for="purpose">용도</label>
+      <input type="text" id="purpose" value="점심">
+    </div>
+    <button id="copyAll" class="ghost" disabled>전체 복사</button>
+  </div>
+
   <div id="summary"></div>
   <div id="cards"></div>
 
@@ -67,15 +103,21 @@ const drop = document.getElementById("drop");
 const fileInput = document.getElementById("file");
 const summary = document.getElementById("summary");
 const cards = document.getElementById("cards");
+const companyInput = document.getElementById("company");
+const purposeInput = document.getElementById("purpose");
+const copyAllBtn = document.getElementById("copyAll");
+
+// 카드별 상태. 회사명/용도가 바뀌면 전부 다시 만든다.
+const items = [];
 
 // Show which device the server actually runs on - the point of this workload.
 fetch("/gpu").then(r => r.json()).then(info => {
   const badge = document.getElementById("device");
   const onGpu = info.cuda_available;
-  badge.textContent = onGpu ? `${info.ocr_device} \u00b7 ${info.gpu_name}` : info.ocr_device;
+  badge.textContent = onGpu ? `${info.ocr_device} · ${info.gpu_name}` : info.ocr_device;
   badge.className = onGpu ? "badge" : "badge cpu";
 }).catch(() => {
-  document.getElementById("device").textContent = "device \uc54c \uc218 \uc5c6\uc74c";
+  document.getElementById("device").textContent = "device 알 수 없음";
 });
 
 drop.addEventListener("click", () => fileInput.click());
@@ -88,6 +130,13 @@ drop.addEventListener("drop", e => {
 });
 fileInput.addEventListener("change", () => sendAll(fileInput.files));
 
+companyInput.addEventListener("input", refreshNames);
+purposeInput.addEventListener("input", refreshNames);
+copyAllBtn.addEventListener("click", () => {
+  const lines = items.map(item => item.code.textContent).filter(Boolean);
+  copyText(lines.join("\n"), copyAllBtn, `${lines.length}건 복사됨`);
+});
+
 /**
  * One request per image, all in flight at once.
  * The server decides how many actually run in parallel (OCR_MAX_CONCURRENCY),
@@ -98,7 +147,9 @@ async function sendAll(fileList) {
   if (files.length === 0) return;
 
   cards.innerHTML = "";
-  summary.innerHTML = `<b>${files.length}</b>\uc7a5 \uc778\uc2dd \uc911\u2026`;
+  items.length = 0;
+  copyAllBtn.disabled = true;
+  summary.innerHTML = `<b>${files.length}</b>장 인식 중…`;
 
   const startedAt = performance.now();
   const results = await Promise.all(files.map(file => sendOne(file)));
@@ -108,11 +159,12 @@ async function sendAll(fileList) {
   const totalTexts = ok.reduce((sum, r) => sum + r.payload.count, 0);
   const totalInferenceMs = ok.reduce((sum, r) => sum + r.payload.elapsed_ms, 0);
 
+  copyAllBtn.disabled = items.length === 0;
   summary.innerHTML =
-    `<b>${ok.length}</b>/<b>${files.length}</b>\uc7a5 \uc131\uacf5 \u00b7 ` +
-    `\ud14d\uc2a4\ud2b8 <b>${totalTexts}</b>\uac74 \u00b7 ` +
-    `\ucd94\ub860 \ud569\uacc4 <b>${totalInferenceMs.toFixed(1)}</b>ms \u00b7 ` +
-    `\uc2e4\uc81c \uacbd\uacfc <b>${wallClockMs.toFixed(1)}</b>ms`;
+    `<b>${ok.length}</b>/<b>${files.length}</b>장 성공 · ` +
+    `텍스트 <b>${totalTexts}</b>건 · ` +
+    `추론 합계 <b>${totalInferenceMs.toFixed(1)}</b>ms · ` +
+    `실제 경과 <b>${wallClockMs.toFixed(1)}</b>ms`;
 }
 
 async function sendOne(file) {
@@ -120,7 +172,7 @@ async function sendOne(file) {
   card.className = "card";
   card.innerHTML = `
     <div class="thumbwrap"><img class="thumb" alt=""></div>
-    <div class="body"><h2></h2><div class="slot">\uc778\uc2dd \uc911\u2026</div></div>`;
+    <div class="body"><h2></h2><div class="slot">인식 중…</div></div>`;
   card.querySelector(".thumb").src = URL.createObjectURL(file);
   card.querySelector("h2").textContent = file.name;
   cards.appendChild(card);
@@ -134,35 +186,134 @@ async function sendOne(file) {
   try {
     response = await fetch("/ocr", { method: "POST", body });
   } catch (err) {
-    slot.innerHTML = `<div class="error">\uc694\uccad \uc2e4\ud328: ${escapeHtml(String(err))}</div>`;
+    slot.innerHTML = `<div class="error">요청 실패: ${escapeHtml(String(err))}</div>`;
     return { file, payload: null };
   }
   const roundTripMs = performance.now() - startedAt;
 
   const payload = await response.json();
   if (!response.ok) {
-    slot.innerHTML = `<div class="error">${response.status} \u2014 ${escapeHtml(String(payload.detail))}</div>`;
+    slot.innerHTML = `<div class="error">${response.status} — ${escapeHtml(String(payload.detail))}</div>`;
     return { file, payload: null };
   }
 
-  slot.innerHTML = renderResult(payload, roundTripMs);
+  renderCard(slot, payload, roundTripMs);
   return { file, payload };
 }
 
-function renderResult(payload, roundTripMs) {
+// --- 파일명 만들기 ----------------------------------------------------------
+
+/** 영수증 텍스트에서 날짜를 찾아 YY.MM.DD로 만든다. 못 찾으면 빈 문자열. */
+function extractDate(texts) {
+  const joined = texts.join(" ");
+
+  // 2026년 9월 13일
+  let m = joined.match(/(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일/);
+  if (m) return formatDate(m[1], m[2], m[3]);
+
+  // 2026-09-13 / 2026.09.13 / 2026/09/13 / 26.08.05
+  m = joined.match(/(?:^|[^\d])(\d{2}|\d{4})[-./](\d{1,2})[-./](\d{1,2})(?:[^\d]|$)/);
+  if (m) return formatDate(m[1], m[2], m[3]);
+
+  return "";
+}
+
+function formatDate(year, month, day) {
+  const yy = String(year).slice(-2);
+  const mm = String(month).padStart(2, "0");
+  const dd = String(day).padStart(2, "0");
+  if (+mm < 1 || +mm > 12 || +dd < 1 || +dd > 31) return "";
+  return `${yy}.${mm}.${dd}`;
+}
+
+/** 상호는 보통 영수증 첫 줄. 요청대로 첫 번째 단어만 쓴다. */
+function extractStore(texts) {
+  const first = (texts[0] || "").trim();
+  return first.split(/\s+/)[0] || "";
+}
+
+function buildName(date, store) {
+  const company = companyInput.value.trim();
+  const purpose = purposeInput.value.trim();
+  return `${date}${company}_${purpose}_${store}`;
+}
+
+function refreshNames() {
+  for (const item of items) {
+    item.code.textContent = buildName(item.date.value.trim(), item.store.value.trim());
+  }
+}
+
+// --- 렌더링 -----------------------------------------------------------------
+
+function renderCard(slot, payload, roundTripMs) {
+  const texts = payload.text.map(t => t.text);
+
+  slot.innerHTML = `
+    <div class="out"><code></code><button type="button">복사</button></div>
+    <div class="inline">
+      <div class="field"><label>날짜</label><input type="text" class="f-date"></div>
+      <div class="field"><label>상호</label><input type="text" class="f-store"></div>
+    </div>
+    ${renderTable(payload, roundTripMs)}`;
+
+  const code = slot.querySelector("code");
+  const dateField = slot.querySelector(".f-date");
+  const storeField = slot.querySelector(".f-store");
+
+  dateField.value = extractDate(texts);
+  storeField.value = extractStore(texts);
+
+  const item = { code, date: dateField, store: storeField };
+  items.push(item);
+
+  const update = () => {
+    code.textContent = buildName(dateField.value.trim(), storeField.value.trim());
+  };
+  dateField.addEventListener("input", update);
+  storeField.addEventListener("input", update);
+  update();
+
+  const button = slot.querySelector(".out button");
+  button.addEventListener("click", () => copyText(code.textContent, button, "복사됨"));
+}
+
+function renderTable(payload, roundTripMs) {
   const stats =
-    `<div class="stats"><b>${payload.count}</b>\uac74 \u00b7 ` +
-    `\ucd94\ub860 <b>${payload.elapsed_ms.toFixed(1)}</b>ms \u00b7 ` +
-    `\uc751\ub2f5 <b>${roundTripMs.toFixed(1)}</b>ms</div>`;
+    `<div class="stats"><b>${payload.count}</b>건 · ` +
+    `추론 <b>${payload.elapsed_ms.toFixed(1)}</b>ms · ` +
+    `응답 <b>${roundTripMs.toFixed(1)}</b>ms</div>`;
 
   if (payload.count === 0) {
-    return `<div class="sub">\uc778\uc2dd\ub41c \ud14d\uc2a4\ud2b8\uac00 \uc5c6\uc2b5\ub2c8\ub2e4.</div>${stats}`;
+    return `<div class="sub">인식된 텍스트가 없습니다.</div>${stats}`;
   }
   const rows = payload.text.map(item =>
     `<tr><td>${escapeHtml(item.text)}</td><td class="conf">${item.confidence.toFixed(3)}</td></tr>`
   ).join("");
-  return `<table><thead><tr><th>\ud14d\uc2a4\ud2b8</th><th class="conf">\uc2e0\ub8b0\ub3c4</th></tr></thead>` +
+  return `<table><thead><tr><th>텍스트</th><th class="conf">신뢰도</th></tr></thead>` +
          `<tbody>${rows}</tbody></table>${stats}`;
+}
+
+// --- 복사 -------------------------------------------------------------------
+
+async function copyText(text, button, doneLabel) {
+  if (!text) return;
+  const original = button.textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // http로 열었거나 권한이 없을 때의 폴백
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    document.execCommand("copy");
+    area.remove();
+  }
+  button.textContent = doneLabel;
+  setTimeout(() => { button.textContent = original; }, 1200);
 }
 
 function escapeHtml(text) {
