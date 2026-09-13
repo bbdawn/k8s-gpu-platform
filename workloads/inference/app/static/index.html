@@ -27,16 +27,20 @@
     padding: 36px 16px; text-align: center; color: var(--muted); cursor: pointer;
   }
   #drop.over { border-color: var(--accent); background: #f2f6ff; color: var(--accent); }
-  .cols { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 16px; }
-  .col { flex: 1 1 320px; min-width: 0; background: var(--card);
-         border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
-  .col h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600; }
-  #preview { max-width: 100%; border-radius: 6px; display: block; }
+  #summary { margin-top: 16px; color: var(--muted); }
+  #summary b { color: var(--text); font-variant-numeric: tabular-nums; }
+  .card { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; background: var(--card);
+          border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  .card .thumbwrap { flex: 0 0 140px; }
+  .card .body { flex: 1 1 260px; min-width: 0; }
+  .card h2 { font-size: 13px; margin: 0 0 8px; font-weight: 600;
+             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .thumb { width: 140px; border-radius: 6px; display: block; }
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--line); }
   th { color: var(--muted); font-size: 12px; font-weight: 600; }
   td.conf { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .stats { margin-top: 10px; color: var(--muted); font-size: 13px; }
+  .stats { margin-top: 8px; color: var(--muted); font-size: 12px; }
   .stats b { color: var(--text); font-variant-numeric: tabular-nums; }
   .error { color: var(--bad); }
   .hint { color: var(--muted); font-size: 12px; margin-top: 14px; }
@@ -45,24 +49,15 @@
 <body>
 <div class="wrap">
   <h1>OCR Workload <span id="device" class="badge">device 확인 중…</span></h1>
-  <div class="sub">영수증 이미지를 올리면 PaddleOCR로 텍스트를 인식합니다. (jpg / jpeg / png)</div>
+  <div class="sub">영수증 이미지를 올리면 PaddleOCR로 텍스트를 인식합니다. 여러 장을 한 번에 올릴 수 있습니다. (jpg / jpeg / png)</div>
 
   <div id="drop">
-    이미지를 끌어다 놓거나 클릭해서 선택하세요
-    <input type="file" id="file" accept="image/jpeg,image/png" hidden>
+    이미지를 끌어다 놓거나 클릭해서 선택하세요 · 여러 장 선택 가능
+    <input type="file" id="file" accept="image/jpeg,image/png" multiple hidden>
   </div>
 
-  <div class="cols">
-    <div class="col">
-      <h2>업로드한 이미지</h2>
-      <img id="preview" alt="" hidden>
-      <div id="nopreview" class="sub">아직 이미지가 없습니다.</div>
-    </div>
-    <div class="col">
-      <h2>인식 결과</h2>
-      <div id="result">대기 중…</div>
-    </div>
-  </div>
+  <div id="summary"></div>
+  <div id="cards"></div>
 
   <div class="hint">API를 직접 호출하려면 <a href="/docs">/docs</a> (Swagger UI)를 사용하세요.</div>
 </div>
@@ -70,18 +65,17 @@
 <script>
 const drop = document.getElementById("drop");
 const fileInput = document.getElementById("file");
-const preview = document.getElementById("preview");
-const nopreview = document.getElementById("nopreview");
-const result = document.getElementById("result");
+const summary = document.getElementById("summary");
+const cards = document.getElementById("cards");
 
 // Show which device the server actually runs on - the point of this workload.
 fetch("/gpu").then(r => r.json()).then(info => {
   const badge = document.getElementById("device");
   const onGpu = info.cuda_available;
-  badge.textContent = onGpu ? `${info.ocr_device} · ${info.gpu_name}` : `${info.ocr_device}`;
+  badge.textContent = onGpu ? `${info.ocr_device} \u00b7 ${info.gpu_name}` : info.ocr_device;
   badge.className = onGpu ? "badge" : "badge cpu";
 }).catch(() => {
-  document.getElementById("device").textContent = "device 알 수 없음";
+  document.getElementById("device").textContent = "device \uc54c \uc218 \uc5c6\uc74c";
 });
 
 drop.addEventListener("click", () => fileInput.click());
@@ -90,18 +84,48 @@ drop.addEventListener("dragleave", () => drop.classList.remove("over"));
 drop.addEventListener("drop", e => {
   e.preventDefault();
   drop.classList.remove("over");
-  if (e.dataTransfer.files[0]) send(e.dataTransfer.files[0]);
+  sendAll(e.dataTransfer.files);
 });
-fileInput.addEventListener("change", () => {
-  if (fileInput.files[0]) send(fileInput.files[0]);
-});
+fileInput.addEventListener("change", () => sendAll(fileInput.files));
 
-async function send(file) {
-  preview.src = URL.createObjectURL(file);
-  preview.hidden = false;
-  nopreview.hidden = true;
-  result.textContent = "인식 중…";
+/**
+ * One request per image, all in flight at once.
+ * The server decides how many actually run in parallel (OCR_MAX_CONCURRENCY),
+ * so the wall-clock total below reflects real queueing behaviour.
+ */
+async function sendAll(fileList) {
+  const files = Array.from(fileList);
+  if (files.length === 0) return;
 
+  cards.innerHTML = "";
+  summary.innerHTML = `<b>${files.length}</b>\uc7a5 \uc778\uc2dd \uc911\u2026`;
+
+  const startedAt = performance.now();
+  const results = await Promise.all(files.map(file => sendOne(file)));
+  const wallClockMs = performance.now() - startedAt;
+
+  const ok = results.filter(r => r.payload);
+  const totalTexts = ok.reduce((sum, r) => sum + r.payload.count, 0);
+  const totalInferenceMs = ok.reduce((sum, r) => sum + r.payload.elapsed_ms, 0);
+
+  summary.innerHTML =
+    `<b>${ok.length}</b>/<b>${files.length}</b>\uc7a5 \uc131\uacf5 \u00b7 ` +
+    `\ud14d\uc2a4\ud2b8 <b>${totalTexts}</b>\uac74 \u00b7 ` +
+    `\ucd94\ub860 \ud569\uacc4 <b>${totalInferenceMs.toFixed(1)}</b>ms \u00b7 ` +
+    `\uc2e4\uc81c \uacbd\uacfc <b>${wallClockMs.toFixed(1)}</b>ms`;
+}
+
+async function sendOne(file) {
+  const card = document.createElement("div");
+  card.className = "card";
+  card.innerHTML = `
+    <div class="thumbwrap"><img class="thumb" alt=""></div>
+    <div class="body"><h2></h2><div class="slot">\uc778\uc2dd \uc911\u2026</div></div>`;
+  card.querySelector(".thumb").src = URL.createObjectURL(file);
+  card.querySelector("h2").textContent = file.name;
+  cards.appendChild(card);
+
+  const slot = card.querySelector(".slot");
   const body = new FormData();
   body.append("file", file);
 
@@ -110,36 +134,35 @@ async function send(file) {
   try {
     response = await fetch("/ocr", { method: "POST", body });
   } catch (err) {
-    result.innerHTML = `<div class="error">요청 실패: ${err}</div>`;
-    return;
+    slot.innerHTML = `<div class="error">\uc694\uccad \uc2e4\ud328: ${escapeHtml(String(err))}</div>`;
+    return { file, payload: null };
   }
   const roundTripMs = performance.now() - startedAt;
 
   const payload = await response.json();
   if (!response.ok) {
-    result.innerHTML = `<div class="error">${response.status} — ${payload.detail}</div>`;
-    return;
+    slot.innerHTML = `<div class="error">${response.status} \u2014 ${escapeHtml(String(payload.detail))}</div>`;
+    return { file, payload: null };
   }
-  render(payload, roundTripMs);
+
+  slot.innerHTML = renderResult(payload, roundTripMs);
+  return { file, payload };
 }
 
-function render(payload, roundTripMs) {
+function renderResult(payload, roundTripMs) {
+  const stats =
+    `<div class="stats"><b>${payload.count}</b>\uac74 \u00b7 ` +
+    `\ucd94\ub860 <b>${payload.elapsed_ms.toFixed(1)}</b>ms \u00b7 ` +
+    `\uc751\ub2f5 <b>${roundTripMs.toFixed(1)}</b>ms</div>`;
+
   if (payload.count === 0) {
-    result.innerHTML = '<div class="sub">인식된 텍스트가 없습니다.</div>';
-    return;
+    return `<div class="sub">\uc778\uc2dd\ub41c \ud14d\uc2a4\ud2b8\uac00 \uc5c6\uc2b5\ub2c8\ub2e4.</div>${stats}`;
   }
   const rows = payload.text.map(item =>
     `<tr><td>${escapeHtml(item.text)}</td><td class="conf">${item.confidence.toFixed(3)}</td></tr>`
   ).join("");
-
-  result.innerHTML = `
-    <table><thead><tr><th>텍스트</th><th class="conf">신뢰도</th></tr></thead>
-    <tbody>${rows}</tbody></table>
-    <div class="stats">
-      <b>${payload.count}</b>건 ·
-      서버 추론 <b>${payload.elapsed_ms.toFixed(1)}</b>ms ·
-      전체 왕복 <b>${roundTripMs.toFixed(1)}</b>ms
-    </div>`;
+  return `<table><thead><tr><th>\ud14d\uc2a4\ud2b8</th><th class="conf">\uc2e0\ub8b0\ub3c4</th></tr></thead>` +
+         `<tbody>${rows}</tbody></table>${stats}`;
 }
 
 function escapeHtml(text) {
