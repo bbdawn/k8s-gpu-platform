@@ -42,10 +42,33 @@ k8s-gpu-platform/
 
 ## 2. 실행
 
-### CPU (개발/검증용)
+### 다시 실행할 때
+
+설치가 끝난 뒤 서버를 띄우는 명령은 이것뿐이다.
 
 ```bash
 cd workloads/inference/app
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+`uvicorn: command not found`가 나면 가상환경이 활성화되지 않은 것이다.
+아래 최초 설치를 먼저 하거나, 만들어 둔 가상환경을 활성화한다.
+
+```bash
+source .venv/bin/activate
+```
+
+포트를 바꾸려면 `--port 8001`처럼 지정한다. 코드를 고치면서 쓸 때는 `--reload`를
+붙이면 자동으로 다시 로드된다. 단, **벤치마크 측정 시에는 `--reload`를 쓰지 말 것**
+(파일 감시가 측정에 개입한다).
+
+### 최초 설치 — CPU (개발/검증용)
+
+```bash
+cd workloads/inference/app
+
+python3.12 -m venv .venv                 # PaddlePaddle은 Python 3.9~3.13만 지원
+source .venv/bin/activate
 
 pip install paddlepaddle==3.3.1          # CPU 빌드
 pip install -r requirements.txt
@@ -53,9 +76,11 @@ pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-### GPU
+### 최초 설치 — GPU
 
 ```bash
+cd workloads/inference/app
+
 # 노드/베이스 이미지의 CUDA 런타임에 맞는 인덱스를 하나 고를 것
 pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
 pip install -r requirements.txt
