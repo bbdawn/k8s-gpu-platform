@@ -81,14 +81,6 @@
   </div>
 
   <div class="controls">
-    <div class="field">
-      <label for="company">회사명</label>
-      <input type="text" id="company" value="(주)우아한형제들">
-    </div>
-    <div class="field">
-      <label for="purpose">용도</label>
-      <input type="text" id="purpose" value="점심">
-    </div>
     <button id="copyAll" class="ghost" disabled>전체 복사</button>
   </div>
 
@@ -103,11 +95,9 @@ const drop = document.getElementById("drop");
 const fileInput = document.getElementById("file");
 const summary = document.getElementById("summary");
 const cards = document.getElementById("cards");
-const companyInput = document.getElementById("company");
-const purposeInput = document.getElementById("purpose");
 const copyAllBtn = document.getElementById("copyAll");
 
-// 카드별 상태. 회사명/용도가 바뀌면 전부 다시 만든다.
+// 카드별 상태. [전체 복사]가 여기서 문자열을 모은다.
 const items = [];
 
 // Show which device the server actually runs on - the point of this workload.
@@ -130,8 +120,6 @@ drop.addEventListener("drop", e => {
 });
 fileInput.addEventListener("change", () => sendAll(fileInput.files));
 
-companyInput.addEventListener("input", refreshNames);
-purposeInput.addEventListener("input", refreshNames);
 copyAllBtn.addEventListener("click", () => {
   const lines = items.map(item => item.code.textContent).filter(Boolean);
   copyText(lines.join("\n"), copyAllBtn, `${lines.length}건 복사됨`);
@@ -201,23 +189,12 @@ async function sendOne(file) {
   return { file, payload };
 }
 
-// --- 파일명 만들기 ----------------------------------------------------------
+// --- 영수증에서 항목 뽑기 ----------------------------------------------------
 
-/** 영수증 텍스트에서 날짜를 찾아 YY.MM.DD로 만든다. 못 찾으면 빈 문자열. */
-function extractDate(texts) {
-  const joined = texts.join(" ");
+// 결제일시로 볼 수 있는 라벨. 영수증마다 표현이 달라 넓게 잡는다.
+const PAID_AT_LABEL = /(결제|거래|승인|매출|구매)\s*(일시|일자|시각|시간)|일\s*시|거래일/;
 
-  // 2026년 9월 13일
-  let m = joined.match(/(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일/);
-  if (m) return formatDate(m[1], m[2], m[3]);
-
-  // 2026-09-13 / 2026.09.13 / 2026/09/13 / 26.08.05
-  m = joined.match(/(?:^|[^\d])(\d{2}|\d{4})[-./](\d{1,2})[-./](\d{1,2})(?:[^\d]|$)/);
-  if (m) return formatDate(m[1], m[2], m[3]);
-
-  return "";
-}
-
+/** YY.MM.DD로 정규화. 달/일이 범위를 벗어나면 빈 문자열. */
 function formatDate(year, month, day) {
   const yy = String(year).slice(-2);
   const mm = String(month).padStart(2, "0");
@@ -226,53 +203,127 @@ function formatDate(year, month, day) {
   return `${yy}.${mm}.${dd}`;
 }
 
-/** 상호는 보통 영수증 첫 줄. 요청대로 첫 번째 단어만 쓴다. */
+/**
+ * 날짜와 시각을 한 덩어리로 잡는다.
+ * PaddleOCR은 "결제일시 2026-08-05 12:34"를 "결제일시:2026-08-0512:34"처럼
+ * 공백 없이 붙여서 내놓는 경우가 많아, 날짜 뒤에 시각이 바로 이어지는 것을 허용해야 한다.
+ */
+const DATETIME_RE = /(?:^|[^\d])(\d{4}|\d{2})[-./](\d{1,2})[-./](\d{1,2})\s*(?:([01]?\d|2[0-3]):([0-5]\d))?/g;
+
+/** 문자열 어딘가에 따로 떨어져 있는 HH:MM에서 시(hour)만 뽑는다. */
+function findHour(text) {
+  const m = text.match(/(?:^|[^\d])([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?(?!\d)/);
+  return m ? Number(m[1]) : null;
+}
+
+/** 한 덩어리의 문자열에서 날짜와 시(hour)를 찾는다. */
+function findDateTime(text) {
+  // 2026년 9월 13일 (+ 뒤따르는 시각)
+  const korean = text.match(/(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일\s*(?:([01]?\d|2[0-3]):([0-5]\d))?/);
+  if (korean) {
+    const date = formatDate(korean[1], korean[2], korean[3]);
+    if (date) {
+      return { date, hour: korean[4] !== undefined ? Number(korean[4]) : findHour(text) };
+    }
+  }
+
+  // 2026-08-05 / 26.08.05 / 2026-08-0512:34
+  // 사업자번호(120-87-65763)처럼 날짜가 아닌 숫자에 걸릴 수 있으므로
+  // 후보를 전부 훑으면서 달/일이 유효한 첫 번째 것을 쓴다.
+  for (const m of text.matchAll(DATETIME_RE)) {
+    const date = formatDate(m[1], m[2], m[3]);
+    if (!date) continue;
+    return { date, hour: m[4] !== undefined ? Number(m[4]) : findHour(text) };
+  }
+
+  return { date: "", hour: findHour(text) };
+}
+
+/**
+ * 결제일시를 찾는다.
+ * 라벨이 붙은 줄(과 뒤따르는 2줄)을 먼저 보고, 없으면 전체에서 처음 나오는 날짜를 쓴다.
+ */
+function extractPaidAt(texts) {
+  for (let i = 0; i < texts.length; i++) {
+    if (!PAID_AT_LABEL.test(texts[i])) continue;
+    const found = findDateTime(texts.slice(i, i + 3).join(" "));
+    if (found.date) return found;
+  }
+  for (let i = 0; i < texts.length; i++) {
+    const found = findDateTime(texts.slice(i, i + 2).join(" "));
+    if (found.date) return found;
+  }
+  return { date: "", hour: null };
+}
+
+/** 17시 이후면 저녁, 이전이면 점심. 시각을 못 찾으면 점심으로 둔다. */
+function purposeFromHour(hour) {
+  return hour !== null && hour >= 17 ? "저녁" : "점심";
+}
+
+/** 가맹점 정보의 '상호' 값. 같은 줄에 있으면 그걸 쓰고, 없으면 다음 줄을 쓴다. */
+function extractMerchant(texts) {
+  for (let i = 0; i < texts.length; i++) {
+    if (!/상\s*호/.test(texts[i])) continue;
+    const inline = texts[i].replace(/^.*상\s*호\s*(명)?\s*[:：]?\s*/, "").trim();
+    if (inline) return inline;
+    const next = (texts[i + 1] || "").trim();
+    if (next) return next;
+  }
+  return "";
+}
+
+/** 맨 뒤에 붙는 상호는 영수증 첫 줄의 첫 단어. */
 function extractStore(texts) {
   const first = (texts[0] || "").trim();
   return first.split(/\s+/)[0] || "";
 }
 
-function buildName(date, store) {
-  const company = companyInput.value.trim();
-  const purpose = purposeInput.value.trim();
-  return `${date}${company}_${purpose}_${store}`;
-}
-
-function refreshNames() {
-  for (const item of items) {
-    item.code.textContent = buildName(item.date.value.trim(), item.store.value.trim());
-  }
+function buildName(date, merchant, purpose, store) {
+  return `${date}${merchant}_${purpose}_${store}`;
 }
 
 // --- 렌더링 -----------------------------------------------------------------
 
 function renderCard(slot, payload, roundTripMs) {
   const texts = payload.text.map(t => t.text);
+  const paidAt = extractPaidAt(texts);
 
   slot.innerHTML = `
     <div class="out"><code></code><button type="button">복사</button></div>
     <div class="inline">
       <div class="field"><label>날짜</label><input type="text" class="f-date"></div>
+      <div class="field"><label>가맹점</label><input type="text" class="f-merchant"></div>
+      <div class="field"><label>용도</label><input type="text" class="f-purpose"></div>
       <div class="field"><label>상호</label><input type="text" class="f-store"></div>
     </div>
     ${renderTable(payload, roundTripMs)}`;
 
   const code = slot.querySelector("code");
-  const dateField = slot.querySelector(".f-date");
-  const storeField = slot.querySelector(".f-store");
+  const fields = {
+    date: slot.querySelector(".f-date"),
+    merchant: slot.querySelector(".f-merchant"),
+    purpose: slot.querySelector(".f-purpose"),
+    store: slot.querySelector(".f-store"),
+  };
 
-  dateField.value = extractDate(texts);
-  storeField.value = extractStore(texts);
-
-  const item = { code, date: dateField, store: storeField };
-  items.push(item);
+  fields.date.value = paidAt.date;
+  fields.merchant.value = extractMerchant(texts);
+  fields.purpose.value = purposeFromHour(paidAt.hour);
+  fields.store.value = extractStore(texts);
 
   const update = () => {
-    code.textContent = buildName(dateField.value.trim(), storeField.value.trim());
+    code.textContent = buildName(
+      fields.date.value.trim(),
+      fields.merchant.value.trim(),
+      fields.purpose.value.trim(),
+      fields.store.value.trim(),
+    );
   };
-  dateField.addEventListener("input", update);
-  storeField.addEventListener("input", update);
+  for (const field of Object.values(fields)) field.addEventListener("input", update);
   update();
+
+  items.push({ code });
 
   const button = slot.querySelector(".out button");
   button.addEventListener("click", () => copyText(code.textContent, button, "복사됨"));
