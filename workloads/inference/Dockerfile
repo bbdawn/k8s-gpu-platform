@@ -35,6 +35,18 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# 런타임 UID. deployment.yaml의 runAsUser와 같은 값이어야 한다.
+ARG APP_UID=10001
+
+# HOME을 명시적으로 고정한다. 베이스 이미지가 HOME을 설정하지 않아서,
+# /etc/passwd에 없는 UID로 실행되면 컨테이너의 HOME이 '/'가 된다. 그러면 paddlex가
+# '~/.paddlex'를 '/.paddlex'로 해석해 루트 디렉터리에 쓰려다 죽는다:
+#   PermissionError: [Errno 13] Permission denied: '/.paddlex'
+# 게다가 아래에서 굽는 모델은 root의 HOME(/root/.paddlex, 권한 700)에 들어가
+# 런타임 UID가 읽지도 못한다. 모델을 굽는 의미가 사라지는 자리라 HOME을 먼저 정한다.
+ENV HOME=/home/app
+RUN mkdir -p ${HOME}
+
 WORKDIR /app
 
 # 의존성 레이어를 먼저 만들어 둔다. 앱 코드만 고치면 재설치하지 않는다.
@@ -57,6 +69,16 @@ RUN if [ "$BAKE_MODELS" = "1" ]; then \
     else \
       echo "BAKE_MODELS=0: 모델을 굽지 않는다. 이 이미지는 런타임에 모델을 내려받는다."; \
     fi
+
+# 여기까지는 root로 실행하고, 결과물을 런타임 UID에게 넘긴다.
+# 그룹 0에 사용자와 같은 권한을 주는 이유: runAsUser가 다른 값으로 바뀌어도
+# (그룹은 0으로 유지되므로) 모델과 코드를 계속 읽을 수 있다.
+RUN chown -R ${APP_UID}:0 ${HOME} /app \
+ && chmod -R g=u ${HOME} /app
+
+# 이미지 자체에 박아 둔다. k8s 밖에서 docker run 할 때도 같은 조건이 되어,
+# 권한 문제가 클러스터에서만 드러나는 일을 막는다.
+USER ${APP_UID}
 
 EXPOSE 8000
 

@@ -71,6 +71,26 @@ def test_health_returns_ok(client):
     assert response.json() == {"status": "ok"}
 
 
+# --- /ready -----------------------------------------------------------------
+
+
+def test_ready_returns_503_when_engine_failed_to_load(client):
+    """The whole point of /ready: it must not report Ready without an engine.
+
+    If this ever returns 200, the readiness probe marks a pod with a dead
+    engine as Ready and the Service routes traffic it can only reject.
+    """
+    response = client.get("/ready")
+    assert response.status_code == 503
+    assert "not available" in response.json()["detail"]
+
+
+def test_ready_returns_ok_with_a_loaded_engine(ocr_client):
+    response = ocr_client.get("/ready")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
+
+
 # --- /gpu -------------------------------------------------------------------
 
 

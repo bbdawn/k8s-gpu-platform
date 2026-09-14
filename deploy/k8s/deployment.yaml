@@ -23,6 +23,8 @@ spec:
       # discovering the problem as a pull failure.
       nodeSelector:
         kubernetes.io/hostname: REPLACE_WITH_BUILD_NODE_HOSTNAME
+      # Must match the Dockerfile's APP_UID build arg: the image bakes the OCR
+      # models under that user's HOME and chowns them to it.
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -43,18 +45,31 @@ spec:
             limits:
               cpu: "2"
               memory: 4Gi
+          # Two endpoints on purpose:
+          #   /ready  503 until the OCR engine is loaded
+          #   /health 200 as soon as the process is up, engine or not
+          #
+          # Startup and readiness must use /ready. Pointed at /health they pass
+          # immediately, so a pod whose engine failed to initialize is marked
+          # Ready and gets traffic it can only answer with 503 - the failure
+          # hides instead of showing up, and a benchmark measures a dead engine.
+          #
+          # Liveness must NOT use /ready: engine init happens once at startup
+          # and is never retried, so a failed engine would restart the pod
+          # forever instead of leaving it up to be diagnosed.
+          #
           # Model load plus the warm-up inference takes tens of seconds on CPU.
-          # The startup probe absorbs that so the liveness probe can stay tight
-          # afterwards without killing a pod that is merely still booting.
+          # The startup probe absorbs that so liveness can stay tight afterwards
+          # without killing a pod that is merely still booting.
           startupProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: http
             periodSeconds: 5
             failureThreshold: 60
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: http
             periodSeconds: 10
           livenessProbe:

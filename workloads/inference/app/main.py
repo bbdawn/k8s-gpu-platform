@@ -110,6 +110,24 @@ def health() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
+@app.get("/ready", response_model=HealthResponse)
+def ready() -> HealthResponse:
+    """Readiness: 503 until the OCR engine is actually loaded.
+
+    Deliberately separate from /health. /health only reports that the process
+    is up, so a readiness probe pointed at it marks the pod Ready even when
+    engine initialization failed - the Service then sends traffic to a pod that
+    answers every /ocr with 503. A benchmark driven off that Ready signal
+    measures a service that cannot serve.
+    """
+    if app.state.ocr_engine is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"OCR engine is not available: {app.state.ocr_error}",
+        )
+    return HealthResponse(status="ready")
+
+
 @app.get("/gpu", response_model=GpuResponse)
 def gpu() -> GpuResponse:
     """Report what this process can see, whether or not CUDA is available."""
