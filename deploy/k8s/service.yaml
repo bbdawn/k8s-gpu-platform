@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ocr
+  labels:
+    app: ocr
+spec:
+  # NodePort rather than ClusterIP: it is reachable at <nodeIP>:30800 for a
+  # quick look, and kubectl port-forward still works against it unchanged.
+  type: NodePort
+  selector:
+    app: ocr
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      nodePort: 30800

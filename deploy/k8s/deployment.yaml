@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ocr
+  labels:
+    app: ocr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ocr
+  template:
+    metadata:
+      labels:
+        app: ocr
+    spec:
+      # Pin to the node the image was built on. There is no registry, so the
+      # image exists on exactly one node and any other node gives
+      # ErrImageNeverPull. It is also required for measurement: unpinned
+      # replicas spread across workers and mix numbers from two machines.
+      # Left as a placeholder on purpose - an unfilled value leaves the pod
+      # Pending with a readable "didn't match node selector" event, which beats
+      # discovering the problem as a pull failure.
+      nodeSelector:
+        kubernetes.io/hostname: REPLACE_WITH_BUILD_NODE_HOSTNAME
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: ocr
+          image: ocr-workload:0.1.0-cpu
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: ocr-config
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          # Model load plus the warm-up inference takes tens of seconds on CPU.
+          # The startup probe absorbs that so the liveness probe can stay tight
+          # afterwards without killing a pod that is merely still booting.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]

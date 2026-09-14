@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ocr-bench
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+
+# There is no registry: the image is built on the node into containerd's k8s.io
+# namespace under this exact name, and nodeSelector pins the pod to that node.
+# If a registry is ever added, set newName here rather than editing deployment.yaml.
+images:
+  - name: ocr-workload
+    newTag: 0.1.0-cpu

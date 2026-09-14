@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ocr-config
+data:
+  # cpu / gpu:0 / auto. Pinned to cpu here so a misdetection cannot silently
+  # change what is being measured.
+  OCR_DEVICE: "cpu"
+  OCR_LANG: "korean"
+
+  # One predict() per pod. The comparison axis is pod count, not in-pod
+  # threads - see README section 4.2.
+  OCR_MAX_CONCURRENCY: "1"
+
+  OCR_WARMUP: "true"
+  OCR_USE_TEXTLINE_ORIENTATION: "false"
+  LOG_LEVEL: "INFO"
+
+  # Paddle's CPU kernels spawn OpenMP threads based on the host core count,
+  # not the container's CPU limit. Left unset, a pod limited to 2 cores still
+  # starts dozens of threads and thrashes. Keep this in step with the CPU
+  # limit in deployment.yaml.
+  OMP_NUM_THREADS: "2"

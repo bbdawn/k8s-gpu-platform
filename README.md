@@ -14,10 +14,11 @@ workload**로서만 존재한다. 따라서 OCR 기능은 최소한으로 유지
 | 항목 | 상태 |
 |---|---|
 | OCR workload (FastAPI + PaddleOCR) | ✅ 완료 |
-| CPU 환경 검증 | ✅ 완료 (수치는 3장) |
+| CPU 환경 검증 | ✅ 완료 (수치는 8장) |
 | 업로드 UI (정적 HTML) | ✅ 완료 |
-| Dockerfile | ❌ 미착수 |
-| Kubernetes 매니페스트 | ❌ 미착수 |
+| Dockerfile (CPU) | ✅ 작성 완료 — 빌드는 **amd64 리눅스에서만** 가능 (4.1) |
+| Kubernetes 매니페스트 | ✅ 작성 완료 — 아직 클러스터에 적용 안 함 |
+| CPU 클러스터 배포 | ❌ 미착수 |
 | GPU(A100) 검증 | ❌ 미착수 — **아직 한 번도 GPU에서 실행된 적 없음** |
 | 4개 모드 벤치마크 | ❌ 미착수 |
 
@@ -25,8 +26,12 @@ workload**로서만 존재한다. 따라서 OCR 기능은 최소한으로 유지
 
 ```
 k8s-gpu-platform/
+├── deploy/
+│   └── k8s/                        Kubernetes 매니페스트 (4장)
 └── workloads/
     └── inference/
+        ├── Dockerfile              CPU 이미지
+        ├── .dockerignore
         └── app/
             ├── main.py              FastAPI 앱 (/, /health, /gpu, /ocr)
             ├── ocr.py               엔진 생성·워밍업·업로드 검증·추론
@@ -166,7 +171,7 @@ ConfigMap으로 분리하기 쉽도록 모든 설정을 환경변수로 뺐다.
 |---|---|---|
 | `OCR_DEVICE` | `auto` | `cpu` / `gpu:0` 강제 지정 |
 | `OCR_LANG` | `korean` | 인식 언어 모델 |
-| `OCR_MAX_CONCURRENCY` | `1` | 동시 `predict()` 허용 수 (아래 4장 참고) |
+| `OCR_MAX_CONCURRENCY` | `1` | 동시 `predict()` 허용 수 (아래 5장 참고) |
 | `OCR_WARMUP` | `true` | 시작 시 워밍업 추론 |
 | `OCR_MAX_IMAGE_BYTES` | `10485760` | 업로드 크기 제한 |
 | `OCR_USE_TEXTLINE_ORIENTATION` | `false` | 방향 분류. 측정 일관성을 위해 off |
@@ -174,9 +179,169 @@ ConfigMap으로 분리하기 쉽도록 모든 설정을 환경변수로 뺐다.
 
 ---
 
-## 4. 벤치마크 설계
+## 4. 배포 (Kubernetes)
 
-### 4.1 GPU 공유 방식별 특성
+CPU 클러스터에 올리는 것까지가 현재 목표다. GPU 이미지는 **베이스 이미지와
+paddle 설치 줄, 두 곳만** 달라진다.
+
+```
+deploy/k8s/
+├── namespace.yaml       ocr-bench
+├── configmap.yaml       앱 환경변수 (3장의 표와 동일)
+├── deployment.yaml      replicas 1, probe, resources
+├── service.yaml         NodePort 30800
+└── kustomization.yaml   이미지 이름을 여기서 갈아끼운다
+
+workloads/inference/Dockerfile   CPU 이미지
+```
+
+### 4.1 빌드는 amd64 리눅스에서 해야 한다
+
+**macOS(Apple Silicon)에서는 이 이미지를 빌드할 수 없다.** `--platform linux/amd64`로
+pip 설치까지는 전부 통과하지만, 모델을 굽는 마지막 단계에서 죽는다.
+
+```
+#15 [9/9] RUN python -c "... ocr.create_ocr_engine() ..."
+#15 1.349 Illegal instruction
+#15 ERROR: ... exit code: 132
+```
+
+원인은 에뮬레이션 게스트가 내놓는 CPU 플래그다. `/proc/cpuinfo`를 보면
+**`sse4_2` 하나뿐이고 AVX / AVX2 / FMA가 없다.** PaddlePaddle 기본 휠은 AVX를
+요구하므로 첫 커널에서 바로 SIGILL이 난다. `import paddle` 하나만 돌려도
+8분 넘게 끝나지 않는다.
+
+**실제 amd64 서버 CPU는 전부 AVX2를 갖고 있으므로 거기서는 나지 않는 문제다.**
+다만 Mac에서는 이미지를 완성할 수도, 스모크 테스트를 할 수도 없다는 뜻이다.
+
+빌드 위치는 둘 중 하나:
+
+- ~~Jenkins~~ — 사내 Jenkins/Nexus는 쓸 수 없다. 새로 세우는 비용이 이 프로젝트의 산출물(벤치마크 수치)에 기여하지 않으므로 하지 않는다.
+- **클러스터 노드에서 직접** — 현재 이 방식을 쓴다. 4.2 참고.
+
+빌드 명령 자체는 어디서 돌리든 같다(리눅스 amd64에서는 `--platform` 불필요).
+
+```bash
+docker build -t nexus.<사내도메인>:8082/ocr-workload:0.1.0-cpu workloads/inference
+```
+
+빌드 마지막 단계에서 **OCR 모델을 이미지에 굽는다.** 폐쇄망 대응이기도 하지만
+더 중요한 이유는 모델 다운로드 시간이 pod 기동 시간에 섞이면 안 되기 때문이다.
+그래서 실패를 삼키는 `warm_up()` 대신 실제 추론을 돌려, 다운로드가 실패하면
+**빌드가 깨지게** 해 두었다. 굽는 단계를 빼고 런타임에 받게 하려면 pod에서
+인터넷이 되어야 하고 `startupProbe` 여유를 더 줘야 한다.
+
+### 4.2 레지스트리 없이 — 노드에서 빌드해 바로 쓰기
+
+**현재 이 프로젝트가 쓰는 경로다.** 사내 Nexus/Jenkins를 쓸 수 없고, 이미지 종류는
+CPU판/GPU판 둘뿐이라 레지스트리와 CI를 새로 세울 이유가 없다. 클러스터 노드가
+곧 amd64 빌드 머신이므로 4.1의 AVX 문제도 같이 해결된다.
+
+```bash
+# worker1에서 (k8s.io 네임스페이스에 넣는 것이 핵심)
+sudo nerdctl -n k8s.io build -t ocr-workload:0.1.0-cpu workloads/inference
+```
+
+`-n k8s.io`를 빼면 **빌드는 성공하는데 kubelet이 그 이미지를 못 찾는다.**
+containerd는 이미지 네임스페이스가 나뉘어 있고, kubelet은 `k8s.io`만 본다.
+`imagePullPolicy: IfNotPresent`는 이 전제에 맞춰 이미 설정되어 있다.
+
+이미지가 **한 노드에만** 존재하므로 `deployment.yaml`의 `nodeSelector`를 그 노드로
+반드시 채울 것. 비워 두면 파드가 `Pending`으로 멈춘다(의도된 동작 — 다른 노드에
+배치됐다가 `ErrImageNeverPull`로 죽는 것보다 원인이 명확하다).
+
+```bash
+kubectl get nodes    # 이름 확인 후 deployment.yaml의 REPLACE_WITH_BUILD_NODE_HOSTNAME 교체
+```
+
+나중에 다른 노드에도 필요해지면 그때 옮기면 된다. 미리 할 일은 아니다.
+
+```bash
+sudo nerdctl -n k8s.io save ocr-workload:0.1.0-cpu \
+  | ssh <worker2> 'sudo nerdctl -n k8s.io load'
+```
+
+### 4.3 배포
+
+빌드한 태그가 `kustomization.yaml`의 기본값(`ocr-workload:0.1.0-cpu`)과 같으므로
+이미지는 손댈 것이 없다. `deployment.yaml`의 `nodeSelector`만 채우면 된다.
+
+```bash
+sed -i 's/REPLACE_WITH_BUILD_NODE_HOSTNAME/<worker1 노드명>/' deploy/k8s/deployment.yaml
+
+kubectl apply -k deploy/k8s
+kubectl -n ocr-bench rollout status deploy/ocr
+```
+
+`rollout status`가 오래 걸려도 정상이다 — 모델 로드와 워밍업에 수십 초가 든다(4.5).
+
+확인:
+
+```bash
+kubectl -n ocr-bench get pods
+kubectl -n ocr-bench logs deploy/ocr | head -20   # "PaddleOCR ready on cpu"
+
+curl http://<노드IP>:30800/health
+curl http://<노드IP>:30800/gpu     # cuda_available: false, ocr_device: cpu 가 정상
+```
+
+NodePort를 못 쓰는 환경이면 `kubectl -n ocr-bench port-forward svc/ocr 8000:8000`.
+
+### 4.4 노드 역할 분담
+
+worker가 2대라면 나누는 편이 낫다.
+
+```
+worker1  ← OCR 파드 (측정 대상, nodeSelector로 고정)
+worker2  ← k6 / hey (부하 생성)
+```
+
+부하 도구를 측정 대상과 같은 노드에서 돌리면 **측정 도구가 측정 대상의 CPU를
+갉아먹는다.** 노드를 나누면 그 오염이 없다.
+
+`nodeSelector`는 이미지 위치 때문만이 아니라 측정 설계상으로도 필요하다. 고정하지
+않으면 replica를 늘렸을 때 스케줄러가 worker들에 나눠 배치하고, `elapsed_ms`에
+**서로 다른 두 머신의 수치가 섞인다.** A100이 붙으면 어차피 GPU 노드 한 대에
+전부 몰아야 하므로, 지금 그 구성을 그대로 쓰는 셈이다.
+
+### 4.5 CPU 배포에서 주의할 것
+
+- **`OMP_NUM_THREADS`를 CPU limit과 맞출 것.** paddle의 CPU 커널은 컨테이너
+  limit이 아니라 **호스트 코어 수**를 보고 스레드를 만든다. 안 맞추면 2코어짜리
+  pod이 수십 개 스레드를 띄우고 서로 밟는다. 현재 둘 다 `2`.
+- **기동이 느리다.** 모델 로드 + 워밍업이 수십 초라서 `startupProbe`를
+  5초 × 60회로 잡아 두었다. 이게 없으면 liveness가 부팅 중인 pod을 죽인다.
+- OCR 엔진 초기화가 실패해도 pod은 뜬다(7장 설계 의도). `Running`인데 `/ocr`이
+  503이면 `/gpu`의 `error` 필드를 먼저 볼 것.
+- **이 단계의 목적은 매니페스트와 이미지 검증이지 성능 측정이 아니다.**
+  CPU 수치는 8장에 있고, 노드 사양이 다르면 비교 대상도 안 된다.
+
+---
+
+### 4.6 (참고) 레지스트리를 쓰게 될 경우
+
+```bash
+docker login nexus.<사내도메인>:8082
+docker push nexus.<사내도메인>:8082/ocr-workload:0.1.0-cpu
+```
+
+pull 인증이 필요하면 시크릿을 만들고 `deployment.yaml`의 `imagePullSecrets`
+주석을 푼다.
+
+```bash
+kubectl -n ocr-bench create secret docker-registry nexus-cred \
+  --docker-server=nexus.<사내도메인>:8082 \
+  --docker-username=<id> --docker-password=<pw>
+```
+
+> Nexus가 HTTPS가 아니면 노드의 containerd에 insecure registry 설정이 필요하다.
+> 사내에서 이미 Nexus를 쓰고 있다면 대개 되어 있지만, `ImagePullBackOff`에
+> `http: server gave HTTP response to HTTPS client`가 보이면 이 경우다.
+> 현재는 레지스트리를 쓰지 않으므로 이 절은 참고용이다. 4.2를 볼 것.
+
+## 5. 벤치마크 설계
+
+### 5.1 GPU 공유 방식별 특성
 
 **핵심: "GPU니까 병렬"이 아니다.** 기본적으로 한 GPU에서 서로 다른 프로세스의
 커널은 동시에 실행되지 않고, CUDA가 컨텍스트를 시분할해 번갈아 돌린다.
@@ -193,9 +358,9 @@ ConfigMap으로 분리하기 쉽도록 모든 설정을 환경변수로 뺐다.
 따라서 **MPS에서 가장 큰 처리량 이득**이 나올 것으로 예상한다. 이 프로젝트의
 핵심 관전 포인트다.
 
-### 4.2 동시성을 어디서 올릴 것인가
+### 5.2 동시성을 어디서 올릴 것인가
 
-CPU에서 측정한 결과가 설계 근거를 제공한다 (영수증 1장 반복, 3장 참고):
+CPU에서 측정한 결과가 설계 근거를 제공한다 (영수증 1장 반복, 8장 참고):
 
 ```
 OCR_MAX_CONCURRENCY=1          OCR_MAX_CONCURRENCY=4
@@ -215,7 +380,7 @@ OCR_MAX_CONCURRENCY=1          OCR_MAX_CONCURRENCY=4
 - ❌ pod 내부 스레드 동시성 늘리기
 - ✅ pod 개수 × GPU 공유 모드 조합 비교
 
-### 4.3 측정 지표
+### 5.3 측정 지표
 
 | 지표 | 출처 |
 |---|---|
@@ -227,7 +392,7 @@ OCR_MAX_CONCURRENCY=1          OCR_MAX_CONCURRENCY=4
 부하는 `k6` / `hey` 같은 도구로 건다. **UI는 기능 확인용이지 측정용이 아니다** —
 브라우저·네트워크·JS 타이머 노이즈가 섞인다.
 
-### 4.4 측정 정확도를 위해 이미 반영한 것
+### 5.4 측정 정확도를 위해 이미 반영한 것
 
 - OCR 모델은 lifespan에서 **1회 초기화 후 재사용** → 모델 로딩 시간이 측정에 안 섞임
 - 시작 시 **워밍업 추론 1회** → 첫 요청의 lazy-load 지연 제거
@@ -236,16 +401,16 @@ OCR_MAX_CONCURRENCY=1          OCR_MAX_CONCURRENCY=4
 
 ---
 
-## 5. 앞으로 확인해야 할 것
+## 6. 앞으로 확인해야 할 것
 
-### 5.1 GPU 환경 구축
+### 6.1 GPU 환경 구축
 
-- [ ] **Dockerfile 작성** — 베이스 이미지 CUDA 버전과 paddle 인덱스(`cu118`/`cu126`/`cu129`)를 **반드시 일치**시킬 것
+- [x] ~~Dockerfile 작성~~ — CPU판 완료. **GPU판은 베이스 이미지 CUDA 버전과 paddle 인덱스(`cu118`/`cu126`/`cu129`)를 반드시 일치시킬 것**
 - [ ] 이미지 빌드 & 레지스트리 푸시
-- [ ] Kubernetes 매니페스트 (Deployment, Service, ConfigMap)
+- [x] ~~Kubernetes 매니페스트 (Deployment, Service, ConfigMap)~~ — CPU 기준 완료, GPU는 `resources.limits`에 `nvidia.com/gpu` 추가 필요
 - [ ] NVIDIA device plugin / GPU Operator 설치 상태 확인
 
-### 5.2 GPU 동작 검증 (최우선)
+### 6.2 GPU 동작 검증 (최우선)
 
 - [ ] `GET /gpu`가 `cuda_available: true`, `gpu_name: NVIDIA A100...`을 반환하는가
 - [ ] 로그에 `initializing PaddleOCR (device=gpu:0 ...)`가 찍히는가
@@ -254,7 +419,7 @@ OCR_MAX_CONCURRENCY=1          OCR_MAX_CONCURRENCY=4
 - [ ] `elapsed_ms`가 CPU 대비 얼마나 줄어드는가 (CPU 기준값: **약 1,400ms**)
 - [ ] `nvidia-smi`로 실제 GPU 메모리 점유 확인
 
-### 5.3 모드별 환경 구성
+### 6.3 모드별 환경 구성
 
 - [ ] **Full GPU** — 기준선(baseline) 확보
 - [ ] **Time-slicing** — device plugin ConfigMap에 `replicas` 설정
@@ -262,14 +427,14 @@ OCR_MAX_CONCURRENCY=1          OCR_MAX_CONCURRENCY=4
 - [ ] **MIG** — A100 파티션 분할. 사용 가능한 프로파일이 **40GB / 80GB 모델에 따라 다르므로**
       (`nvidia-smi mig -lgip`로 확인) 먼저 보유 장비를 확정할 것. 프로파일별 비교 여부도 결정 필요
 
-### 5.4 벤치마크 실행
+### 6.4 벤치마크 실행
 
 - [ ] 부하 도구 선정 및 시나리오 스크립트 작성
 - [ ] 고정할 변수 정의 (이미지 크기, 요청 수, 워밍업 요청 수, 측정 시간)
 - [ ] 4개 모드 × pod 개수(1/2/4/8) 매트릭스 측정
 - [ ] 결과 표/그래프 정리
 
-### 5.5 열려 있는 결정 사항
+### 6.5 열려 있는 결정 사항
 
 - [ ] 인식 모델 조합을 고정할 것인가 — 현재 검출은 `PP-OCRv5_server_det`, 인식은 `korean_PP-OCRv5_mobile_rec`가 자동 선택된다. **server/mobile 조합에 따라 GPU 이용률이 크게 달라지므로** 벤치마크 변수로 삼을지 고정할지 결정 필요
 - [ ] 입력 이미지를 1종으로 고정할지, 크기별로 나눌지 (작은 이미지는 GPU를 못 채운다)
@@ -278,7 +443,7 @@ OCR_MAX_CONCURRENCY=1          OCR_MAX_CONCURRENCY=4
 
 ---
 
-## 6. 알려진 제약 / 주의사항
+## 7. 알려진 제약 / 주의사항
 
 - **`paddlepaddle-gpu`는 PyPI에 없다.** CUDA별 전용 인덱스에서 받아야 하며,
   `-i` 옵션이 전체 인덱스를 덮어쓰기 때문에 `requirements.txt`에 넣을 수 없다.
@@ -294,7 +459,7 @@ OCR_MAX_CONCURRENCY=1          OCR_MAX_CONCURRENCY=4
 
 ---
 
-## 7. 검증 기록
+## 8. 검증 기록
 
 ### CPU (2026-09-13, macOS arm64 / Python 3.12 / paddlepaddle 3.3.1 / paddleocr 3.7.0)
 
@@ -303,7 +468,7 @@ pytest              8 passed (실제 추론 테스트 포함)
 GET /gpu            cuda_available: false, ocr_device: cpu, ocr_ready: true
 POST /ocr (영수증)   10건 인식, confidence 0.936 ~ 0.9999, elapsed_ms 1400~1560
 POST /ocr (영수증2)  7건 인식
-동시성              MAX_CONCURRENCY 1/4 모두 0.72 req/s (4.2 참고)
+동시성              MAX_CONCURRENCY 1/4 모두 0.72 req/s (5.2 참고)
 ```
 
 한글 영수증 10줄을 **전부 정확히** 인식했다. 실제 인식 결과:
